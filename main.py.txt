@@ -1,0 +1,149 @@
+import os
+import httpx
+import asyncio
+import tempfile
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY", "")
+ASSEMBLYAI_BASE    = "https://api.assemblyai.com/v2"
+
+app = FastAPI(title="Voice Analysis API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _headers():
+    return {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+
+
+async def _upload_audio(audio_bytes: bytes) -> str:
+    """رفع الصوت إلى AssemblyAI والحصول على upload_url"""
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            f"{ASSEMBLYAI_BASE}/upload",
+            headers={"authorization": ASSEMBLYAI_API_KEY},
+            content=audio_bytes,
+        )
+        r.raise_for_status()
+        return r.json()["upload_url"]
+
+
+async def _request_transcript(audio_url: str) -> str:
+    """طلب التحليل من AssemblyAI والحصول على transcript_id"""
+    payload = {
+        "audio_url": audio_url,
+        "sentiment_analysis": True,
+        "auto_highlights": True,
+        "language_detection": True,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{ASSEMBLYAI_BASE}/transcript",
+            headers=_headers(),
+            json=payload,
+        )
+        r.raise_for_status()
+        return r.json()["id"]
+
+
+async def _poll_transcript(transcript_id: str) -> dict:
+    """انتظار اكتمال التحليل"""
+    url = f"{ASSEMBLYAI_BASE}/transcript/{transcript_id}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        for _ in range(120):   # max 2 دقيقة
+            r = await client.get(url, headers=_headers())
+            r.raise_for_status()
+            data = r.json()
+            if data["status"] == "completed":
+                return data
+            if data["status"] == "error":
+                raise HTTPException(500, detail=data.get("error", "AssemblyAI error"))
+            await asyncio.sleep(3)
+    raise HTTPException(504, detail="Timeout waiting for transcript")
+
+
+def _build_response(data: dict) -> dict:
+    """بناء الرد الموحد"""
+    sentiment_summary = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
+    sentiment_details = []
+
+    for result in data.get("sentiment_analysis_results") or []:
+        label = result["sentiment"]          # "POSITIVE" / "NEGATIVE" / "NEUTRAL"
+        sentiment_summary[label] += 1
+        sentiment_details.append({
+            "text":       result["text"],
+            "sentiment":  label,
+            "confidence": round(result["confidence"] * 100, 1),
+        })
+
+    dominant = max(sentiment_summary, key=sentiment_summary.get)
+    emotion_map = {
+        "POSITIVE": {"ar": "إيجابي 😊", "en": "Positive 😊", "fr": "Positif 😊"},
+        "NEGATIVE": {"ar": "سلبي 😔",   "en": "Negative 😔", "fr": "Négatif 😔"},
+        "NEUTRAL":  {"ar": "محايد 😐",   "en": "Neutral 😐",  "fr": "Neutre 😐"},
+    }
+
+    keywords = []
+    highlights = data.get("auto_highlights_result") or {}
+    for h in (highlights.get("results") or [])[:5]:
+        keywords.append(h["text"])
+
+    total = sum(sentiment_summary.values()) or 1
+    return {
+        "success": True,
+        "transcript": data.get("text") or "",
+        "language":   data.get("language_code") or "unknown",
+        "dominant_emotion":       dominant,
+        "dominant_emotion_label": emotion_map[dominant],
+        "sentiment_scores": {
+            "positive": round(sentiment_summary["POSITIVE"] / total * 100, 1),
+            "negative": round(sentiment_summary["NEGATIVE"] / total * 100, 1),
+            "neutral":  round(sentiment_summary["NEUTRAL"]  / total * 100, 1),
+        },
+        "sentiment_details": sentiment_details,
+        "keywords": keywords,
+    }
+
+
+# ── endpoints ──────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"status": "Voice Analysis API is running ✅"}
+
+
+@app.post("/analyze-voice")
+async def analyze_voice(file: UploadFile = File(...)):
+    try:
+        audio_bytes  = await file.read()
+        upload_url   = await _upload_audio(audio_bytes)
+        transcript_id = await _request_transcript(upload_url)
+        data         = await _poll_transcript(transcript_id)
+        return _build_response(data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze-voice-url")
+async def analyze_voice_url(payload: dict):
+    try:
+        audio_url = payload.get("audio_url")
+        if not audio_url:
+            raise HTTPException(status_code=400, detail="audio_url is required")
+        transcript_id = await _request_transcript(audio_url)
+        data          = await _poll_transcript(transcript_id)
+        return _build_response(data)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
